@@ -1,11 +1,14 @@
 import urllib.request
 import json
+import numpy as np
+
 from brute_force import BruteForceIndex
 from kdtree import KDTreeIndex
 from hnsw import HNSWIndex
 
+
 class VectorDB:
-    def __init__(self, index_type='brute_force', embed_model='all-MiniLM-L6-v2', embed_backend='sentence-transformers'):
+    def __init__(self, index_type='brute_force', embed_model='all-MiniLM-L6-v2', embed_backend='ollama'):
         """
         Initialize the Vector Database.
         index_type: 'brute_force', 'kdtree', or 'hnsw'
@@ -15,16 +18,24 @@ class VectorDB:
         self.index_type = index_type
         self.embed_model = embed_model
         self.embed_backend = embed_backend
-        self.documents = {}  # Store mapping doc_id -> Document
+        self.documents = {}  # doc_id -> {"text": ..., "metadata": ...}
+        self.model = None    # lazy-loaded only for sentence-transformers
 
+        # ✅ FIX: Lazy import — sentence_transformers sirf tab load ho
+        # jab user ne explicitly wo backend select kiya ho
         if embed_backend == 'sentence-transformers':
-            from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(embed_model)
-        else:
-            self.model = None
+            try:
+                from sentence_transformers import SentenceTransformer
+                self.model = SentenceTransformer(embed_model)
+            except ImportError:
+                raise ImportError(
+                    "sentence-transformers not installed!\n"
+                    "Run: pip install sentence-transformers\n"
+                    "Ya Ollama backend use karo sidebar mein."
+                )
 
         if index_type == 'brute_force':
-            self.index = BruteForceIndex(metric='euclidean')
+            self.index = BruteForceIndex(metric='cosine')
         elif index_type == 'kdtree':
             self.index = KDTreeIndex()
         elif index_type == 'hnsw':
@@ -32,57 +43,59 @@ class VectorDB:
         else:
             raise ValueError(f"Unknown index type: {index_type}")
 
-    def get_embedding(self, text):
-        """
-        Get embeddings according to the configured backend.
-        """
+    def get_embedding(self, text: str) -> list:
+        """Get normalized embeddings for the given text."""
         if self.embed_backend == 'sentence-transformers':
-            vector = self.model.encode(text)
-            if hasattr(vector, "tolist"):
-                return vector.tolist()
-            return vector
+            vector = self.model.encode(text, normalize_embeddings=True)
+            return vector.tolist()
 
-        # Fallback to local Ollama API
+        # Ollama API
         url = "http://localhost:11434/api/embed"
-        data = {
-            "model": self.embed_model,
-            "input": text
-        }
-        
-        req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers={'Content-Type': 'application/json'})
+        data = {"model": self.embed_model, "input": text}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
         try:
-            with urllib.request.urlopen(req) as response:
+            with urllib.request.urlopen(req, timeout=30) as response:
                 result = json.loads(response.read().decode())
-                return result['embeddings'][0]
-        except Exception as e:
-            raise RuntimeError(f"Failed to get embedding from Ollama: {e}")
+                vec = np.array(result['embeddings'][0], dtype=np.float32)
+                # Normalize for cosine similarity
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    vec = vec / norm
+                return vec.tolist()
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"Ollama server unreachable! Kya Ollama chal raha hai?\n"
+                f"Run: ollama serve\n"
+                f"Error: {e}"
+            )
+        except KeyError:
+            raise RuntimeError(
+                f"Ollama response mein 'embeddings' key nahi mili. "
+                f"Model '{self.embed_model}' pull kiya hai?\n"
+                f"Run: ollama pull {self.embed_model}"
+            )
 
-    def add(self, doc_id, text, metadata=None):
-        """
-        Embed the document and add it to the index.
-        """
+    def add(self, doc_id: str, text: str, metadata: dict = None):
+        """Embed and add a document to the index."""
         vector = self.get_embedding(text)
-        self.documents[doc_id] = {
-            "text": text,
-            "metadata": metadata or {}
-        }
+        self.documents[doc_id] = {"text": text, "metadata": metadata or {}}
         self.index.add(vector, doc_id)
 
-    def search(self, query, top_k=5):
-        """
-        Search for the top_k most similar documents to the query.
-        """
+    def search(self, query: str, top_k: int = 5) -> list:
+        """Search top_k most similar documents."""
         query_vector = self.get_embedding(query)
         results = self.index.search(query_vector, k=top_k)
-        
-        search_results = []
-        for dist, doc_id in results:
-            doc = self.documents[doc_id]
-            search_results.append({
+        return [
+            {
                 "doc_id": doc_id,
-                "text": doc["text"],
-                "metadata": doc["metadata"],
+                "text": self.documents[doc_id]["text"],
+                "metadata": self.documents[doc_id]["metadata"],
                 "distance": dist
-            })
-            
-        return search_results
+            }
+            for dist, doc_id in results
+            if doc_id in self.documents
+        ]
